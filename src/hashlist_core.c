@@ -81,6 +81,27 @@ static void bucket_vector_push(BucketVector *vec, Py_ssize_t idx) {
     vec->indices[vec->size++] = idx;
 }
 
+static inline Py_ssize_t hash_bucket_index(Py_ssize_t token, Py_ssize_t capacity) {
+    size_t z = ((size_t)token) + 0x9e3779b97f4a7c15;
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9;
+    return (Py_ssize_t)(z & (capacity - 1));
+}
+
+static void hash_table_rebuild(HashListObject *self);
+
+static void hash_table_push_index(HashListObject *self, Py_ssize_t item_index, PyObject *item) {
+    if (self->table_capacity == 0 || self->buckets == NULL) {
+        hash_table_rebuild(self);
+        if (self->table_capacity == 0 || self->buckets == NULL) {
+            return;
+        }
+    }
+    Py_ssize_t token = get_safe_token_c(item);
+    Py_ssize_t bucket_idx = hash_bucket_index(token, self->table_capacity);
+    self->bucket_tokens[bucket_idx] = token;
+    bucket_vector_push(&self->buckets[bucket_idx], item_index);
+}
+
 static void hash_table_rebuild(HashListObject *self) {
     if (self->buckets != NULL) {
         for (Py_ssize_t i = 0; i < self->table_capacity; i++) {
@@ -103,10 +124,7 @@ static void hash_table_rebuild(HashListObject *self) {
     Py_ssize_t mask = capacity - 1;
     for (Py_ssize_t i = 0; i < self->size; i++) {
         Py_ssize_t token = get_safe_token_c(self->ob_item[i]);
-        size_t z = ((size_t)token) + 0x9e3779b97f4a7c15;
-        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9;
-        Py_ssize_t bucket_idx = z & mask;
-        
+        Py_ssize_t bucket_idx = hash_bucket_index(token, capacity);
         self->bucket_tokens[bucket_idx] = token;
         bucket_vector_push(&self->buckets[bucket_idx], i);
     }
@@ -119,10 +137,7 @@ static Py_ssize_t hash_table_lookup(HashListObject *self, PyObject *item) {
     if (self->table_capacity == 0 || self->size == 0) return -1;
     
     Py_ssize_t token = get_safe_token_c(item);
-    size_t z = ((size_t)token) + 0x9e3779b97f4a7c15;
-    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9;
-    Py_ssize_t bucket_idx = z & (self->table_capacity - 1);
-    
+    Py_ssize_t bucket_idx = hash_bucket_index(token, self->table_capacity);
     BucketVector *vec = &self->buckets[bucket_idx];
     for (Py_ssize_t i = 0; i < vec->size; i++) {
         Py_ssize_t idx = vec->indices[i];
@@ -222,18 +237,21 @@ static int hashlist_init(HashListObject *self, PyObject *args, PyObject *kwds) {
 
 static PyObject *hashlist_append(HashListObject *self, PyObject *item) {
     if (hashlist_resize(self, self->size + 1) < 0) return NULL;
-    
+
     Py_INCREF(item);
     self->ob_item[self->size - 1] = item;
-    
-    self->is_dirty = 1;
+
+    if (self->buckets != NULL && self->table_capacity > 0) {
+        hash_table_push_index(self, self->size - 1, item);
+        self->is_dirty = 0;
+    } else self->is_dirty = 1;
     Py_RETURN_NONE;
 }
 
 static PyObject *hashlist_extend(HashListObject *self, PyObject *iterable) {
     PyObject *iterator = PyObject_GetIter(iterable);
     if (iterator == NULL) return NULL;
-    
+
     PyObject *item;
     while ((item = PyIter_Next(iterator))) {
         if (hashlist_resize(self, self->size + 1) < 0) {
@@ -242,11 +260,14 @@ static PyObject *hashlist_extend(HashListObject *self, PyObject *iterable) {
             return NULL;
         }
         self->ob_item[self->size - 1] = item;
+        if (self->buckets != NULL && self->table_capacity > 0) {
+            hash_table_push_index(self, self->size - 1, item);
+        }
     }
     Py_DECREF(iterator);
     if (PyErr_Occurred()) return NULL;
-    
-    self->is_dirty = 1;
+
+    self->is_dirty = 0;
     Py_RETURN_NONE;
 }
 
@@ -322,11 +343,7 @@ static PyObject *hashlist_count(HashListObject *self, PyObject *item) {
     if (self->table_capacity == 0 || self->size == 0) return PyLong_FromLong(0);
     
     Py_ssize_t token = get_safe_token_c(item);
-    Py_ssize_t mask = self->table_capacity - 1;
-    size_t z = ((size_t)token) + 0x9e3779b97f4a7c15;
-    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9;
-    Py_ssize_t bucket_idx = z & mask;
-    
+    Py_ssize_t bucket_idx = hash_bucket_index(token, self->table_capacity);
     BucketVector *vec = &self->buckets[bucket_idx];
     Py_ssize_t cnt = 0;
     for (Py_ssize_t i = 0; i < vec->size; i++) {
